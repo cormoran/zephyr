@@ -1,0 +1,5 @@
+description: Nordic nRF UARTE Half-Duplex UART
+
+compatible: "nordic,nrf-uarte-half-duplex"
+
+include: ["nordic,nrf-uart-common.yaml", "memory-region.yaml"]

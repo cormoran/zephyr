@@ -10,7 +10,7 @@ menuconfig UART_NRFX
 	select SERIAL_SUPPORT_INTERRUPT
 	select SERIAL_SUPPORT_ASYNC
 	select PINCTRL
-	depends on DT_HAS_NORDIC_NRF_UART_ENABLED || DT_HAS_NORDIC_NRF_UARTE_ENABLED
+	depends on DT_HAS_NORDIC_NRF_UART_ENABLED || DT_HAS_NORDIC_NRF_UARTE_ENABLED || DT_HAS_NORDIC_NRF_UARTE_HALF_DUPLEX_ENABLED
 	help
 	  Enable support for nrfx UART drivers for nRF MCU series.
 	  Peripherals with the same instance ID cannot be used together,
@@ -25,6 +25,10 @@ config UART_NRFX_UART
 config UART_NRFX_UARTE
 	def_bool y
 	depends on DT_HAS_NORDIC_NRF_UARTE_ENABLED
+
+config UART_NRFX_UARTE_HALF_DUPLEX
+    def_bool y
+    depends on DT_HAS_NORDIC_NRF_UARTE_HALF_DUPLEX_ENABLED
 
 config UART_NRFX_UARTE_LEGACY_SHIM
 	bool "Legacy UARTE shim"
@@ -71,6 +75,26 @@ rsource "Kconfig.nrfx_uart_instance"
 endif
 
 if HAS_HW_NRF_UARTE3
+nrfx_uart_num = 3
+rsource "Kconfig.nrfx_uart_instance"
+endif
+
+if HAS_HW_NRF_UARTE_HALF_DUPLEX0
+nrfx_uart_num = 0
+rsource "Kconfig.nrfx_uart_instance"
+endif
+
+if HAS_HW_NRF_UARTE_HALF_DUPLEX1
+nrfx_uart_num = 1
+rsource "Kconfig.nrfx_uart_instance"
+endif
+
+if HAS_HW_NRF_UARTE_HALF_DUPLEX2
+nrfx_uart_num = 2
+rsource "Kconfig.nrfx_uart_instance"
+endif
+
+if HAS_HW_NRF_UARTE_HALF_DUPLEX3
 nrfx_uart_num = 3
 rsource "Kconfig.nrfx_uart_instance"
 endif
