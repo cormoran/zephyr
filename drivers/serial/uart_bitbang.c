@@ -38,6 +38,8 @@ struct uart_bitbang_config {
 	struct uart_config *uart_cfg;
 	/* MSB first */
 	bool msb;
+	/* Half duplex mode */
+	bool half_duplex;
 };
 
 struct uart_bitbang_data {
@@ -71,6 +73,8 @@ struct uart_bitbang_data {
 	struct gpio_callback rx_gpio_cb_data;
 	/* Rx ring buffer */
 	struct ring_buf *rx_ringbuf;
+	uint32_t last_rx_start;
+	uint32_t last_tx_start;
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
 	/* Interrupt flags */
 #define UART_BITBANG_IRQ_TC   (1 << 0)
@@ -140,7 +144,6 @@ static void uart_bitbang_rx_counter_top_interrupt(const struct device *dev, void
 	struct uart_bitbang_data *data = uart_dev->data;
 	uint8_t len = uart_bitbang_data_bits_to_len(config->uart_cfg->data_bits);
 	int rc;
-
 	/* Rx state machine */
 	if (data->rx_state == UART_BITBANG_DATA) {
 
@@ -153,7 +156,7 @@ static void uart_bitbang_rx_counter_top_interrupt(const struct device *dev, void
 			if (config->uart_cfg->parity != UART_CFG_PARITY_NONE) {
 				data->rx_state = UART_BITBANG_PARITY;
 			} else {
-				data->rx_state = UART_BITBANG_COMPLETE;
+				data->rx_state = UART_BITBANG_STOP_BIT_1;
 			}
 		}
 
@@ -161,15 +164,29 @@ static void uart_bitbang_rx_counter_top_interrupt(const struct device *dev, void
 
 		/* Read parity bit value */
 		data->rx_parity = gpio_pin_get_dt(&config->rx_gpio);
-		data->rx_state = UART_BITBANG_COMPLETE;
+		data->rx_state = UART_BITBANG_STOP_BIT_1;
+	} else if (data->rx_state == UART_BITBANG_STOP_BIT_1) {
+		if (gpio_pin_get_dt(&config->rx_gpio) == 1) {
+			data->rx_state = UART_BITBANG_COMPLETE;
+		} else {
+			LOG_WRN("RX: Stop bit not yet");
+		}
 	}
-
 	/* Intentional fall-through */
 	if (data->rx_state == UART_BITBANG_COMPLETE) {
 
 		/* Stop rx counter */
 		counter_stop(config->rx_counter);
 		data->rx_state = UART_BITBANG_IDLE;
+
+		{
+			int64_t rx_duration_nano =
+				(uint64_t)(k_cycle_get_32() - data->last_rx_start) * NSEC_PER_SEC /
+				CONFIG_SYS_CLOCK_TICKS_PER_SEC;
+			int64_t expected_nano = 11 * NSEC_PER_SEC / config->uart_cfg->baudrate;
+			LOG_WRN("Rx complete in %lld us (gap: %lld us)", rx_duration_nano / 1000,
+				(rx_duration_nano - expected_nano) / 1000);
+		}
 
 		/* Enable rx gpio interrupt */
 		rc = gpio_pin_interrupt_configure_dt(&config->rx_gpio, GPIO_INT_EDGE_FALLING);
@@ -219,6 +236,7 @@ static void uart_bitbang_rx_callback(const struct device *dev, struct gpio_callb
 	data->rx_data = 0;
 	data->rx_index = 0;
 	data->rx_state = UART_BITBANG_DATA;
+	data->last_rx_start = k_cycle_get_32();
 	counter_reset(config->rx_counter);
 	counter_start(config->rx_counter);
 
@@ -261,6 +279,14 @@ static void uart_bitbang_tx_counter_top_interrupt(const struct device *dev, void
 	uint8_t len = uart_bitbang_data_bits_to_len(config->uart_cfg->data_bits);
 	uint32_t size;
 
+	// {
+	// 	uint32_t now = k_cycle_get_32();
+	// 	uint64_t cycle = now - data->last_tx_start;
+	// 	uint64_t tx_duration_nano = cycle * NSEC_PER_SEC / CONFIG_SYS_CLOCK_TICKS_PER_SEC;
+	// 	LOG_WRN("Tx(%d): %llu cycles (%llu us)", data->tx_state, cycle,
+	// 		tx_duration_nano / 1000);
+	// }
+
 	/* Tx state machine */
 	switch (data->tx_state) {
 	case UART_BITBANG_IDLE:
@@ -272,6 +298,14 @@ static void uart_bitbang_tx_counter_top_interrupt(const struct device *dev, void
 			data->tx_index = 0;
 			data->tx_parity = uart_bitbang_compute_parity(uart_dev, *data->tx_data);
 			data->tx_state = UART_BITBANG_START_BIT;
+			if (config->half_duplex) {
+				int rc = gpio_pin_interrupt_configure_dt(&config->rx_gpio,
+									 GPIO_INT_DISABLE);
+				if (rc < 0) {
+					LOG_ERR("Couldn't configure rx pin (%d)", rc);
+				}
+				gpio_pin_configure_dt(&config->tx_gpio, GPIO_OUTPUT_ACTIVE);
+			}
 			/* Assert RS485 driver enable pin */
 			if ((config->uart_cfg->flow_ctrl == UART_CFG_FLOW_CTRL_RS485) &&
 			    (config->de_gpio.port != NULL)) {
@@ -297,12 +331,12 @@ static void uart_bitbang_tx_counter_top_interrupt(const struct device *dev, void
 		gpio_pin_set_dt(&config->tx_gpio, 0);
 		/* Prepare transmission of data */
 		data->tx_state = UART_BITBANG_DATA;
+		data->last_tx_start = k_cycle_get_32();
 		break;
 	case UART_BITBANG_DATA:
 		/* Set tx gpio depending of the bit index */
 		const int shift = config->msb ? (len - 1 - data->tx_index) : data->tx_index;
 		const int d = (*data->tx_data >> shift) & 0x1;
-
 		gpio_pin_set_dt(&config->tx_gpio, d);
 		data->tx_index++;
 		if (data->tx_index == len) {
@@ -320,7 +354,19 @@ static void uart_bitbang_tx_counter_top_interrupt(const struct device *dev, void
 		break;
 	case UART_BITBANG_STOP_BIT_1:
 		/* Set stop bit value */
-		gpio_pin_set_dt(&config->tx_gpio, 1);
+		if (config->half_duplex) {
+			int rc = gpio_pin_configure_dt(&config->tx_gpio, GPIO_INPUT);
+			if (rc < 0) {
+				LOG_ERR("Couldn't configure rx pin as input (%d)", rc);
+			}
+			rc = gpio_pin_interrupt_configure_dt(&config->rx_gpio,
+							     GPIO_INT_EDGE_FALLING);
+			if (rc < 0) {
+				LOG_ERR("Couldn't configure rx pin as interrupt (%d)", rc);
+			}
+		} else {
+			gpio_pin_set_dt(&config->tx_gpio, 1);
+		}
 		if (config->uart_cfg->stop_bits > UART_CFG_STOP_BITS_1) {
 			data->tx_state = UART_BITBANG_STOP_BIT_2;
 		} else {
@@ -335,6 +381,12 @@ static void uart_bitbang_tx_counter_top_interrupt(const struct device *dev, void
 		/* Terminate current transfer */
 		ring_buf_get_finish(data->tx_ringbuf, sizeof(uint16_t));
 		data->tx_state = UART_BITBANG_IDLE;
+		int64_t tx_duration_nano = (uint64_t)(k_cycle_get_32() - data->last_tx_start) *
+					   NSEC_PER_SEC / CONFIG_SYS_CLOCK_TICKS_PER_SEC;
+		// start bit(1) + data bits(8) + parity bit(1) + stop bits(2)
+		int64_t expected_nano = 12 * NSEC_PER_SEC / config->uart_cfg->baudrate;
+		LOG_WRN("Tx complete in %lld us (gap: %lld us)", tx_duration_nano / 1000,
+			(expected_nano - tx_duration_nano) / 1000);
 		break;
 	}
 }
@@ -343,7 +395,6 @@ static void uart_bitbang_poll_out_u16(const struct device *dev, uint16_t out_u16
 {
 	const struct uart_bitbang_config *config = dev->config;
 	struct uart_bitbang_data *data = dev->data;
-
 	/* Transmit data */
 	if (config->tx_gpio.port != NULL) {
 
@@ -567,7 +618,7 @@ static void uart_bitbang_irq_callback_set(const struct device *dev,
 
 #endif /* CONFIG_UART_INTERRUPT_DRIVEN */
 
-static DEVICE_API(uart, uart_bitbang_api) = {
+static const struct uart_driver_api uart_bitbang_api = {
 	.poll_in = uart_bitbang_poll_in,
 	.poll_out = uart_bitbang_poll_out,
 #ifdef CONFIG_UART_WIDE_DATA
@@ -618,13 +669,14 @@ static int uart_bitbang_init(const struct device *dev)
 	 */
 	if (config->tx_gpio.port != NULL) {
 		if (config->tx_counter == NULL) {
-			LOG_ERR("Couldn't configure tx counter");
+			LOG_ERR("Couldn't configure tx counter: device not defined");
 			return -ENODEV;
 		} else if (config->tx_counter != config->rx_counter) {
 			if (!device_is_ready(config->tx_counter)) {
-				LOG_ERR("Couldn't configure tx counter");
+				LOG_ERR("Couldn't configure tx counter: device not ready");
 				return -ENODEV;
 			}
+			LOG_WRN("Setup tx counter");
 			data->tx_counter_cfg.callback = uart_bitbang_tx_counter_top_interrupt;
 			data->tx_counter_cfg.ticks = counter_get_frequency(config->tx_counter) /
 						     config->uart_cfg->baudrate;
@@ -654,6 +706,7 @@ static int uart_bitbang_init(const struct device *dev)
 				LOG_ERR("Couldn't configure rx counter");
 				return -ENODEV;
 			}
+			LOG_WRN("Setup rx counter");
 			data->rx_counter_cfg.callback = uart_bitbang_rx_counter_top_interrupt;
 			data->rx_counter_cfg.ticks = counter_get_frequency(config->rx_counter) /
 						     config->uart_cfg->baudrate;
@@ -678,9 +731,13 @@ static int uart_bitbang_init(const struct device *dev)
 			LOG_ERR("Couldn't configure tx/rx counter");
 			return -ENODEV;
 		}
+		LOG_WRN("Setup shared tx/rx counter");
 		data->tx_counter_cfg.callback = uart_bitbang_tx_rx_counter_top_interrupt;
 		data->tx_counter_cfg.ticks =
 			counter_get_frequency(config->tx_counter) / config->uart_cfg->baudrate;
+		LOG_WRN("Counter frequency: %u, Baudrate: %u, Ticks: %u",
+			counter_get_frequency(config->tx_counter), config->uart_cfg->baudrate,
+			data->tx_counter_cfg.ticks);
 		data->tx_counter_cfg.user_data = (void *)dev;
 		data->tx_counter_cfg.flags = 0;
 		rc = counter_set_top_value(config->tx_counter, &data->tx_counter_cfg);
@@ -696,15 +753,17 @@ static int uart_bitbang_init(const struct device *dev)
 			LOG_ERR("GPIO port for tx pin is not ready");
 			return -ENODEV;
 		}
-		rc = gpio_pin_configure_dt(&config->tx_gpio, GPIO_OUTPUT_INACTIVE);
-		if (rc < 0) {
-			LOG_ERR("Couldn't configure tx pin (%d)", rc);
-			return rc;
-		}
-		rc = gpio_pin_set_dt(&config->tx_gpio, 1);
-		if (rc < 0) {
-			LOG_ERR("Couldn't set tx pin (%d)", rc);
-			return rc;
+		if (!config->half_duplex) { // port is set as rx by default for half-duplex
+			rc = gpio_pin_configure_dt(&config->tx_gpio, GPIO_OUTPUT_INACTIVE);
+			if (rc < 0) {
+				LOG_ERR("Couldn't configure tx pin (%d)", rc);
+				return rc;
+			}
+			rc = gpio_pin_set_dt(&config->tx_gpio, 1);
+			if (rc < 0) {
+				LOG_ERR("Couldn't set tx pin (%d)", rc);
+				return rc;
+			}
 		}
 	}
 
@@ -770,12 +829,11 @@ static int uart_bitbang_init(const struct device *dev)
 		.tx_gpio = GPIO_DT_SPEC_INST_GET_OR(index, tx_gpios, {0}),                         \
 		.rx_gpio = GPIO_DT_SPEC_INST_GET_OR(index, rx_gpios, {0}),                         \
 		.de_gpio = GPIO_DT_SPEC_INST_GET_OR(index, de_gpios, {0}),                         \
-		.tx_counter = DEVICE_DT_GET_OR_NULL(                                               \
-			DT_CHILD(DT_INST_PHANDLE(index, tx_timer), counter)),                      \
-		.rx_counter = DEVICE_DT_GET_OR_NULL(                                               \
-			DT_CHILD(DT_INST_PHANDLE(index, rx_timer), counter)),                      \
+		.tx_counter = DEVICE_DT_GET_OR_NULL(DT_INST_PHANDLE(index, tx_timer)),             \
+		.rx_counter = DEVICE_DT_GET_OR_NULL(DT_INST_PHANDLE(index, rx_timer)),             \
 		.uart_cfg = &uart_cfg_##index,                                                     \
 		.msb = DT_INST_PROP_OR(index, msb, false),                                         \
+		.half_duplex = DT_INST_PROP_OR(index, half_duplex, false),                         \
 	};                                                                                         \
 	RING_BUF_DECLARE(uart_bitbang_tx_ringbuf##index, DT_INST_PROP(index, tx_fifo_size));       \
 	RING_BUF_DECLARE(uart_bitbang_rx_ringbuf##index, DT_INST_PROP(index, rx_fifo_size));       \
@@ -784,8 +842,8 @@ static int uart_bitbang_init(const struct device *dev)
 		.tx_ringbuf = &uart_bitbang_tx_ringbuf##index,                                     \
 		.rx_ringbuf = &uart_bitbang_rx_ringbuf##index,                                     \
 	};                                                                                         \
-	DEVICE_DT_INST_DEFINE(index, uart_bitbang_init, PM_DEVICE_DT_INST_GET(index),              \
-			      &uart_bitbang_data_##index, &uart_bitbang_config_##index,            \
-			      POST_KERNEL, CONFIG_SERIAL_INIT_PRIORITY, &uart_bitbang_api);
+	DEVICE_DT_INST_DEFINE(index, uart_bitbang_init, NULL, &uart_bitbang_data_##index,          \
+			      &uart_bitbang_config_##index, POST_KERNEL,                           \
+			      CONFIG_SERIAL_INIT_PRIORITY, &uart_bitbang_api);
 
 DT_INST_FOREACH_STATUS_OKAY(UART_BITBANG_INIT)

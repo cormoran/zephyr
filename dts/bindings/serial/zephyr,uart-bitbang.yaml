@@ -63,3 +63,11 @@ properties:
       Set to enable DE (driver enable) signal, which can be used to enable
       the driver of an external RS-485 transceiver. Note hw-flow-control
       should be set to false.
+
+  half-duplex:
+    type: boolean
+    description: |
+      Set to enable half-duplex mode. In this mode, the same wire is used
+      for transmission and reception. Thus, when transmitting data, the
+      Rx pin is configured as input only when not transmitting data, and
+      the Tx pin is configured as output only when transmitting data.
