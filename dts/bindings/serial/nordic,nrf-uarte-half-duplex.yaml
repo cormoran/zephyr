@@ -3,3 +3,9 @@ description: Nordic nRF UARTE Half-Duplex UART
 compatible: "nordic,nrf-uarte-half-duplex"
 
 include: ["nordic,nrf-uart-common.yaml", "memory-region.yaml"]
+
+properties:
+  switching-delay-us:
+    description: Time in microseconds to wait after RX before starting TX.
+    type: int
+    default: 100

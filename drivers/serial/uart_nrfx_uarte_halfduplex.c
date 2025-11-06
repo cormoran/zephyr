@@ -105,6 +105,7 @@ struct uarte_nrfx_int_driven {
 	bool rx_irq_enabled;
 #endif
 	atomic_t fifo_fill_lock;
+	bool rx_irq_processed;
 };
 #endif
 
@@ -115,6 +116,8 @@ struct uarte_nrfx_data {
 #endif
 #ifdef UARTE_INTERRUPT_DRIVEN
 	struct uarte_nrfx_int_driven *int_driven;
+	struct k_work_delayable tx_ready_work;
+	struct device *dev;
 #endif
 	atomic_val_t poll_out_lock;
 	atomic_t flags;
@@ -126,6 +129,7 @@ struct uarte_nrfx_data {
 		UARTE_MODE_TX,
 		UARTE_MODE_RX
 	} mode;
+	uint32_t last_rx_end_time_ticks;
 };
 
 /* If enabled then ENDTX is PPI'ed to TXSTOP */
@@ -183,6 +187,7 @@ struct uarte_nrfx_config {
 
 	uint8_t *poll_out_byte;
 	uint8_t *poll_in_byte;
+	uint32_t switching_delay_us;
 };
 
 static inline NRF_UARTE_Type *get_uarte_instance(const struct device *dev)
@@ -219,7 +224,8 @@ static int switch_to_tx_mode(const struct device *dev)
 		LOG_WRN("Cannot switch from IDLE to TX mode");
 		return -ECANCELED;
 	}
-
+	nrf_uarte_task_trigger(uarte, NRF_UARTE_TASK_STOPRX);
+	// LOG_WRN("Switching to TX mode");
 	nrf_uarte_disable(uarte);
 	int ret = pinctrl_apply_state(config->pcfg, PINCTRL_STATE_TX);
 	if (ret < 0) {
@@ -245,6 +251,7 @@ static int switch_to_rx_mode(const struct device *dev)
 		LOG_WRN("Cannot switch from IDLE to RX mode");
 		return -ECANCELED;
 	}
+	// LOG_WRN("Switching to RX mode");
 	nrf_uarte_disable(uarte);
 	int ret = pinctrl_apply_state(config->pcfg, PINCTRL_STATE_RX);
 	if (ret < 0) {
@@ -254,6 +261,10 @@ static int switch_to_rx_mode(const struct device *dev)
 	data->mode = UARTE_MODE_RX;
 
 	nrf_uarte_enable(uarte);
+	if (!config->disable_rx) {
+		nrf_uarte_event_clear(uarte, NRF_UARTE_EVENT_ENDRX);
+		nrf_uarte_task_trigger(uarte, NRF_UARTE_TASK_STARTRX);
+	}
 	return 0;
 }
 
@@ -287,23 +298,37 @@ static void uarte_nrfx_isr_int(const void *arg)
 		return;
 	}
 
+	bool switch_to_rx = false;
 	if (nrf_uarte_event_check(uarte, NRF_UARTE_EVENT_TXSTOPPED)) {
-		switch_to_rx_mode(dev);
+		switch_to_rx = true;
 		data->int_driven->fifo_fill_lock = 0; // accepts new transfer
 		if (data->int_driven->disable_tx_irq) {
 			nrf_uarte_int_disable(uarte, NRF_UARTE_INT_TXSTOPPED_MASK);
 			data->int_driven->disable_tx_irq = false;
+			switch_to_rx_mode(dev);
 			return;
 		}
 	}
 
 	if (nrf_uarte_event_check(uarte, NRF_UARTE_EVENT_ERROR)) {
-		switch_to_rx_mode(dev); // TODO: it's just in case of TX error
+		switch_to_rx = true;
+		// LOG_ERR("UARTE error occurred (on tx end %d)", switch_to_rx ? 1 : 0);
+		// switch_to_rx_mode(dev); // TODO: it's just in case of TX error
 		nrf_uarte_event_clear(uarte, NRF_UARTE_EVENT_ERROR);
+	}
+
+	if (!data->int_driven->rx_irq_processed &&
+	    nrf_uarte_event_check(uarte, NRF_UARTE_EVENT_ENDRX)) {
+		data->int_driven->rx_irq_processed = true;
+		data->last_rx_end_time_ticks = k_cycle_get_32();
+		k_work_reschedule(&data->tx_ready_work, K_USEC(config->switching_delay_us));
 	}
 
 	if (data->int_driven->cb) {
 		data->int_driven->cb(dev, data->int_driven->cb_data);
+	}
+	if (switch_to_rx) {
+		switch_to_rx_mode(dev);
 	}
 #endif /* UARTE_INTERRUPT_DRIVEN */
 }
@@ -434,10 +459,19 @@ static int uarte_nrfx_err_check(const struct device *dev)
  */
 static bool is_tx_ready(const struct device *dev)
 {
+	const struct uarte_nrfx_data *data = dev->data;
 	const struct uarte_nrfx_config *config = dev->config;
 	NRF_UARTE_Type *uarte = get_uarte_instance(dev);
 	bool ppi_endtx = config->flags & UARTE_CFG_FLAG_PPI_ENDTX ||
 			 IS_ENABLED(UARTE_HAS_ENDTX_STOPTX_SHORT);
+
+	const uint64_t duration = k_cycle_get_32() - data->last_rx_end_time_ticks;
+	const uint64_t elapsed_us = duration * USEC_PER_SEC / sys_clock_hw_cycles_per_sec();
+	if (elapsed_us < config->switching_delay_us) {
+		LOG_WRN("Switching delay not elapsed yet (remaining %llu us)",
+			config->switching_delay_us - elapsed_us);
+		return false;
+	}
 
 	return nrf_uarte_event_check(uarte, NRF_UARTE_EVENT_TXSTOPPED) ||
 	       (!ppi_endtx ? nrf_uarte_event_check(uarte, NRF_UARTE_EVENT_ENDTX) : 0);
@@ -493,6 +527,7 @@ static void tx_start(const struct device *dev, const uint8_t *buf, size_t len)
 	}
 #endif
 	if (len > 0 && switch_to_tx_mode(dev) != 0) {
+		LOG_WRN("Failed to switch to TX mode");
 		return;
 	}
 
@@ -514,17 +549,28 @@ static void tx_start(const struct device *dev, const uint8_t *buf, size_t len)
 static int uarte_nrfx_poll_in(const struct device *dev, unsigned char *c)
 {
 	const struct uarte_nrfx_config *config = dev->config;
+	struct uarte_nrfx_data *data = dev->data;
 	NRF_UARTE_Type *uarte = get_uarte_instance(dev);
 
 	if (!nrf_uarte_event_check(uarte, NRF_UARTE_EVENT_ENDRX)) {
 		return -1;
 	}
 
+#ifdef UARTE_INTERRUPT_DRIVEN
+	if (!data->int_driven->rx_irq_enabled) {
+		data->last_rx_end_time_ticks = k_cycle_get_32();
+	}
+#endif
+
 	*c = *config->poll_in_byte;
 
 	/* clear the interrupt */
+
 	nrf_uarte_event_clear(uarte, NRF_UARTE_EVENT_ENDRX);
 	nrf_uarte_task_trigger(uarte, NRF_UARTE_TASK_STARTRX);
+#ifdef UARTE_INTERRUPT_DRIVEN
+	data->int_driven->rx_irq_processed = false;
+#endif
 
 	return 0;
 }
@@ -562,6 +608,17 @@ static void uarte_nrfx_poll_out(const struct device *dev, unsigned char c)
 }
 
 #ifdef UARTE_INTERRUPT_DRIVEN
+
+static void uarte_tx_ready_work_handler(struct k_work *work)
+{
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	struct uarte_nrfx_data *data = CONTAINER_OF(dwork, struct uarte_nrfx_data, tx_ready_work);
+
+	if (data->int_driven->cb) {
+		data->int_driven->cb(data->dev, data->int_driven->cb_data);
+	}
+}
+
 /** Interrupt driven FIFO fill function */
 static int uarte_nrfx_fifo_fill(const struct device *dev, const uint8_t *tx_data, int len)
 {
@@ -595,9 +652,11 @@ static int uarte_nrfx_fifo_read(const struct device *dev, uint8_t *rx_data, cons
 	int num_rx = 0;
 	NRF_UARTE_Type *uarte = get_uarte_instance(dev);
 	const struct uarte_nrfx_config *config = dev->config;
+	struct uarte_nrfx_data *data = dev->data;
 
 	if (size > 0 && nrf_uarte_event_check(uarte, NRF_UARTE_EVENT_ENDRX)) {
 		/* Clear the interrupt */
+		data->int_driven->rx_irq_processed = false;
 		nrf_uarte_event_clear(uarte, NRF_UARTE_EVENT_ENDRX);
 
 		/* Receive a character */
@@ -614,11 +673,15 @@ static void uarte_nrfx_irq_tx_enable(const struct device *dev)
 {
 	NRF_UARTE_Type *uarte = get_uarte_instance(dev);
 	struct uarte_nrfx_data *data = dev->data;
+	const struct uarte_nrfx_config *cfg = dev->config;
 	unsigned int key = irq_lock();
 
 	data->int_driven->disable_tx_irq = false;
 	data->int_driven->tx_irq_enabled = true;
 	nrf_uarte_int_enable(uarte, NRF_UARTE_INT_TXSTOPPED_MASK);
+
+	// fake event to set TXSTOPPED
+	tx_start(dev, cfg->poll_out_byte, 0);
 
 	irq_unlock(key);
 }
@@ -771,12 +834,13 @@ static int uarte_instance_init(const struct device *dev, uint8_t interrupts_acti
 	int err;
 	NRF_UARTE_Type *uarte = get_uarte_instance(dev);
 	const struct uarte_nrfx_config *cfg = dev->config;
-
-#if defined(CONFIG_UART_USE_RUNTIME_CONFIGURE) || defined(UARTE_ENHANCED_POLL_OUT)
 	struct uarte_nrfx_data *data = dev->data;
-#endif
 
 	nrf_uarte_disable(uarte);
+
+#ifdef UARTE_INTERRUPT_DRIVEN
+	k_work_init_delayable(&data->tx_ready_work, uarte_tx_ready_work_handler);
+#endif
 
 #ifdef CONFIG_ARCH_POSIX
 	/* For simulation the DT provided peripheral address needs to be corrected
@@ -818,6 +882,9 @@ static int uarte_instance_init(const struct device *dev, uint8_t interrupts_acti
 		nrf_uarte_enable(uarte);
 
 		if (!cfg->disable_rx) {
+#ifdef UARTE_INTERRUPT_DRIVEN
+			data->int_driven->rx_irq_processed = false;
+#endif
 			nrf_uarte_event_clear(uarte, NRF_UARTE_EVENT_ENDRX);
 
 			nrf_uarte_rx_buffer_set(uarte, cfg->poll_in_byte, 1);
@@ -894,6 +961,9 @@ static int uarte_nrfx_pm_action(const struct device *dev, enum pm_device_action 
 		nrf_uarte_enable(uarte);
 
 		if (!cfg->disable_rx) {
+#ifdef UARTE_INTERRUPT_DRIVEN
+			data->int_driven->rx_irq_processed = false;
+#endif
 			nrf_uarte_event_clear(uarte, NRF_UARTE_EVENT_ENDRX);
 			nrf_uarte_task_trigger(uarte, NRF_UARTE_TASK_STARTRX);
 #ifdef UARTE_INTERRUPT_DRIVEN
@@ -922,6 +992,9 @@ static int uarte_nrfx_pm_action(const struct device *dev, enum pm_device_action 
 				/* Busy wait for event to register */
 				Z_SPIN_DELAY(2);
 			}
+#ifdef UARTE_INTERRUPT_DRIVEN
+			data->int_driven->rx_irq_processed = false;
+#endif
 			nrf_uarte_event_clear(uarte, NRF_UARTE_EVENT_RXSTARTED);
 			nrf_uarte_event_clear(uarte, NRF_UARTE_EVENT_RXTO);
 			nrf_uarte_event_clear(uarte, NRF_UARTE_EVENT_ENDRX);
@@ -1010,7 +1083,7 @@ static int uarte_nrfx_pm_action(const struct device *dev, enum pm_device_action 
 			IF_ENABLED(CONFIG_UART_##idx##_INTERRUPT_DRIVEN,                           \
 				   (.int_driven = &uarte##idx##_int_driven, ))                     \
 				.mode = UARTE_MODE_IDLE,                                           \
-	};                                                                                         \
+		IF_ENABLED(INTERRUUPT_DRIVEN, (.dev = DEVICE_DT_GET(UARTE(idx)), ))};              \
 	COND_CODE_1(CONFIG_UART_USE_RUNTIME_CONFIGURE, (),                                         \
 		    (BUILD_ASSERT(NRF_BAUDRATE(UARTE_PROP(idx, current_speed)) > 0,                \
 				  "Unsupported baudrate");))                                       \
@@ -1033,6 +1106,7 @@ static int uarte_nrfx_pm_action(const struct device *dev, enum pm_device_action 
 		UARTE_DISABLE_RX_INIT(UARTE(idx)),                                                 \
 		.poll_out_byte = &uarte##idx##_poll_out_byte,                                      \
 		.poll_in_byte = &uarte##idx##_poll_in_byte,                                        \
+		.switching_delay_us = UARTE_PROP(idx, switching_delay_us),                         \
 		IF_ENABLED(CONFIG_UART_##idx##_ASYNC, (.tx_cache = uarte##idx##_tx_cache,          \
 						       .rx_flush_buf = uarte##idx##_flush_buf, ))  \
 			IF_ENABLED(CONFIG_UART_##idx##_NRF_HW_ASYNC,                               \
