@@ -220,10 +220,6 @@ static int switch_to_tx_mode(const struct device *dev)
 	if (data->mode == UARTE_MODE_TX) {
 		return 0;
 	}
-	if (data->mode == UARTE_MODE_IDLE) {
-		LOG_WRN("Cannot switch from IDLE to TX mode");
-		return -ECANCELED;
-	}
 	nrf_uarte_task_trigger(uarte, NRF_UARTE_TASK_STOPRX);
 	// LOG_WRN("Switching to TX mode");
 	nrf_uarte_disable(uarte);
@@ -246,10 +242,6 @@ static int switch_to_rx_mode(const struct device *dev)
 
 	if (data->mode == UARTE_MODE_RX) {
 		return 0;
-	}
-	if (data->mode == UARTE_MODE_IDLE) {
-		LOG_WRN("Cannot switch from IDLE to RX mode");
-		return -ECANCELED;
 	}
 	// LOG_WRN("Switching to RX mode");
 	nrf_uarte_disable(uarte);
@@ -298,9 +290,7 @@ static void uarte_nrfx_isr_int(const void *arg)
 		return;
 	}
 
-	bool switch_to_rx = false;
 	if (nrf_uarte_event_check(uarte, NRF_UARTE_EVENT_TXSTOPPED)) {
-		switch_to_rx = true;
 		data->int_driven->fifo_fill_lock = 0; // accepts new transfer
 		if (data->int_driven->disable_tx_irq) {
 			nrf_uarte_int_disable(uarte, NRF_UARTE_INT_TXSTOPPED_MASK);
@@ -311,24 +301,20 @@ static void uarte_nrfx_isr_int(const void *arg)
 	}
 
 	if (nrf_uarte_event_check(uarte, NRF_UARTE_EVENT_ERROR)) {
-		switch_to_rx = true;
 		// LOG_ERR("UARTE error occurred (on tx end %d)", switch_to_rx ? 1 : 0);
 		// switch_to_rx_mode(dev); // TODO: it's just in case of TX error
 		nrf_uarte_event_clear(uarte, NRF_UARTE_EVENT_ERROR);
 	}
 
-	if (!data->int_driven->rx_irq_processed &&
-	    nrf_uarte_event_check(uarte, NRF_UARTE_EVENT_ENDRX)) {
-		data->int_driven->rx_irq_processed = true;
-		data->last_rx_end_time_ticks = k_cycle_get_32();
-		k_work_reschedule(&data->tx_ready_work, K_USEC(config->switching_delay_us));
-	}
+	// if (!data->int_driven->rx_irq_processed &&
+	//     nrf_uarte_event_check(uarte, NRF_UARTE_EVENT_ENDRX)) {
+	// 	data->int_driven->rx_irq_processed = true;
+	// 	data->last_rx_end_time_ticks = k_cycle_get_32();
+	// 	k_work_reschedule(&data->tx_ready_work, K_USEC(config->switching_delay_us));
+	// }
 
 	if (data->int_driven->cb) {
 		data->int_driven->cb(dev, data->int_driven->cb_data);
-	}
-	if (switch_to_rx) {
-		switch_to_rx_mode(dev);
 	}
 #endif /* UARTE_INTERRUPT_DRIVEN */
 }
@@ -465,13 +451,13 @@ static bool is_tx_ready(const struct device *dev)
 	bool ppi_endtx = config->flags & UARTE_CFG_FLAG_PPI_ENDTX ||
 			 IS_ENABLED(UARTE_HAS_ENDTX_STOPTX_SHORT);
 
-	const uint64_t duration = k_cycle_get_32() - data->last_rx_end_time_ticks;
-	const uint64_t elapsed_us = duration * USEC_PER_SEC / sys_clock_hw_cycles_per_sec();
-	if (elapsed_us < config->switching_delay_us) {
-		LOG_WRN("Switching delay not elapsed yet (remaining %llu us)",
-			config->switching_delay_us - elapsed_us);
-		return false;
-	}
+	// const uint64_t duration = k_cycle_get_32() - data->last_rx_end_time_ticks;
+	// const uint64_t elapsed_us = duration * USEC_PER_SEC / sys_clock_hw_cycles_per_sec();
+	// if (elapsed_us < config->switching_delay_us) {
+	// 	LOG_WRN("Switching delay not elapsed yet (remaining %llu us)",
+	// 		config->switching_delay_us - elapsed_us);
+	// 	return false;
+	// }
 
 	return nrf_uarte_event_check(uarte, NRF_UARTE_EVENT_TXSTOPPED) ||
 	       (!ppi_endtx ? nrf_uarte_event_check(uarte, NRF_UARTE_EVENT_ENDTX) : 0);
@@ -526,10 +512,10 @@ static void tx_start(const struct device *dev, const uint8_t *buf, size_t len)
 		return;
 	}
 #endif
-	if (len > 0 && switch_to_tx_mode(dev) != 0) {
-		LOG_WRN("Failed to switch to TX mode");
-		return;
-	}
+	// if (len > 0 && switch_to_tx_mode(dev) != 0) {
+	// 	LOG_WRN("Failed to switch to TX mode");
+	// 	return;
+	// }
 
 	nrf_uarte_tx_buffer_set(uarte, buf, len);
 	nrf_uarte_event_clear(uarte, NRF_UARTE_EVENT_ENDTX);
@@ -676,6 +662,8 @@ static void uarte_nrfx_irq_tx_enable(const struct device *dev)
 	const struct uarte_nrfx_config *cfg = dev->config;
 	unsigned int key = irq_lock();
 
+	switch_to_tx_mode(dev);
+
 	data->int_driven->disable_tx_irq = false;
 	data->int_driven->tx_irq_enabled = true;
 	nrf_uarte_int_enable(uarte, NRF_UARTE_INT_TXSTOPPED_MASK);
@@ -693,6 +681,7 @@ static void uarte_nrfx_irq_tx_disable(const struct device *dev)
 	/* TX IRQ will be disabled after current transmission is finished */
 	data->int_driven->disable_tx_irq = true;
 	data->int_driven->tx_irq_enabled = false;
+	// switch_to_rx_mode is done in IRQ
 }
 
 /** Interrupt driven transfer ready function */
