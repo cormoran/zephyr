@@ -588,6 +588,19 @@ static void uarte_nrfx_isr_int(const void *arg)
 
 	if (nrf_uarte_event_check(uarte, NRF_UARTE_EVENT_ERROR)) {
 		nrf_uarte_event_clear(uarte, NRF_UARTE_EVENT_ERROR);
+		/* Diagnostic: the interrupt-driven RX path receives one byte per
+		 * ENDRX into a 1-byte EasyDMA buffer, so any ISR-servicing latency
+		 * beyond the small HW RX FIFO overruns and silently drops bytes,
+		 * surfacing only as downstream framing/CRC errors. Read and log
+		 * ERRORSRC so an OVERRUN can actually be observed on a failing link.
+		 */
+		uint32_t errsrc = nrf_uarte_errorsrc_get_and_clear(uarte);
+
+		LOG_WRN("UARTE RX error: src=0x%x%s%s%s%s", errsrc,
+			(errsrc & NRF_UARTE_ERROR_OVERRUN_MASK) ? " overrun" : "",
+			(errsrc & NRF_UARTE_ERROR_FRAMING_MASK) ? " framing" : "",
+			(errsrc & NRF_UARTE_ERROR_PARITY_MASK) ? " parity" : "",
+			(errsrc & NRF_UARTE_ERROR_BREAK_MASK) ? " break" : "");
 	}
 
 	if (data->int_driven->cb) {
